@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """VPN Gate SSTP 节点检测流水线（模板仓库）。
-
 流程:
-  1. 抓取 VPN Gate 原始节点（官方 API，失败回退 GitHub 镜像）
-  2. 只保留带 TCP 入口的 SSTP 节点（VPN Gate 的 TCP 端口即 SSTP 端口）
-  3. 去重 → 按 Ping 预排序 →（可选）截断
-  4. 并发调用检测 Worker
-  5. 合并静态优选域名与优选 API 端点
-  6. 生成 public/data.json + public/index.html + public/nodes.txt
-
+  1. 抓取 VPN Gate 原始节点（多源合并：官方 API + 镜像 + 自定义源，按 IP 去重）
+  2. 合并手动节点池 manual_nodes.txt（用于补 VPN Gate 稀缺的国家，例如美国）
+  3. 只保留带 TCP 入口的 SSTP 节点（VPN Gate 的 TCP 端口即 SSTP 端口）
+  4. 去重 → 按 Ping 预排序 → 按国家轮转（保证任何截断都不会整国消失）→（可选）截断
+  5. 并发调用检测 Worker
+  6. 合并静态优选域名与优选 API 端点
+  7. 生成 public/data.json + public/index.html + public/nodes.txt
 配置全部来自环境变量。模板仓库约定：用户只需在仓库里配置 Secret `DOMAIN`，
 工作流会拼出检测地址；本地运行时可以直接设置 CHECK_WORKER。
 """
-
 from __future__ import annotations
 
 import base64
@@ -43,10 +41,10 @@ for _stream in (sys.stdout, sys.stderr):
 # 常量
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-
 SCHEMA_VERSION = 1
 
 # VPN Gate 没有 HTTPS 接口，官方 API 只提供 HTTP。
+# 注意：api/iphone 是移动端快照，通常只有约 100 条，且排序偏向亚洲节点。
 DEFAULT_VPNGATE_API = "http://www.vpngate.net/api/iphone/"
 DEFAULT_VPNGATE_MIRROR = (
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json"
@@ -79,7 +77,6 @@ DATA_CENTER_ORG_KEYWORDS = [
     "AKAMAI", "CLOUDFLARE", "FASTLY", "RACKSPACE", "EQUINIX", "LINODE", "VULTR",
     "HURRICANE", "TENCENT", "ALIBABA", "ALIYUN", "LEASEWEB",
 ]
-
 RESIDENTIAL_ORG_KEYWORDS = [
     "NTT EAST", "NTT WEST", "NTT COMMUNICATIONS", "NTT BROADBAND", "KDDI", "DOCOMO",
     "SOFTBANK", "AU COMMUNICATIONS", "J:COM", "JCOM", "OCN", "BIGLOBE",
@@ -103,12 +100,11 @@ COUNTRY_ZH = {
     "LV": "拉脱维亚", "EE": "爱沙尼亚", "LT": "立陶宛", "SK": "斯洛伐克",
     "SI": "斯洛文尼亚", "BG": "保加利亚", "RS": "塞尔维亚", "GE": "格鲁吉亚",
     "MD": "摩尔多瓦", "AM": "亚美尼亚", "KZ": "哈萨克斯坦", "UZ": "乌兹别克斯坦",
-    "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
+    "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸", "VE": "委内瑞拉",
 }
 
 _PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6|tcp-client)\b", re.M)
 _REMOTE_RE = re.compile(r"^remote\s+(\S+)\s+(\d+)", re.M)
-
 
 # ---------------------------------------------------------------------------
 # 日志与错误
@@ -189,11 +185,9 @@ def normalize_worker_base(raw: str) -> str:
     parts = urlsplit(value)
     if not parts.netloc:
         raise ConfigError(f"无法解析检测 Worker 地址：{value!r}")
-
     path = parts.path.rstrip("/")
     if not path.endswith("/check"):
         path = path + "/check"
-
     query = parts.query
     if "sstp=" not in query:
         query = (query + "&" if query else "") + "sstp=vpn:vpn@"
@@ -216,7 +210,6 @@ def normalize_endpoint(raw: str) -> str | None:
     text = text.split("#", 1)[0].strip().split("/", 1)[0].strip()
     if not text:
         return None
-
     host: str
     port: str
     if text.startswith("["):
@@ -235,7 +228,6 @@ def normalize_endpoint(raw: str) -> str | None:
             host, port = text, "443"
         if colons <= 1 and not re.fullmatch(r"[A-Za-z0-9.-]+", host):
             return None
-
     try:
         port_number = int(port)
     except ValueError:
@@ -289,6 +281,8 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
+    manual_nodes_file: str
+    min_countries: int
 
     @classmethod
     def load(cls) -> "Config":
@@ -323,6 +317,10 @@ class Config:
             min_success_ratio=_env_float("MIN_SUCCESS_RATIO", 0.0, minimum=0.0),
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
+            manual_nodes_file=os.environ.get(
+                "MANUAL_NODES_FILE", os.path.join(REPO_DIR, "manual_nodes.txt")
+            ),
+            min_countries=_env_int("MIN_COUNTRIES", 10),
         )
 
 
@@ -354,30 +352,49 @@ def make_session(pool_size: int = 32, retries: int = 2) -> requests.Session:
 # ---------------------------------------------------------------------------
 # 数据抓取与解析
 # ---------------------------------------------------------------------------
-def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str, Any]], str]:
-    try:
-        log("VPN GATE", f"获取官方 API: {cfg.vpngate_api}")
-        resp = session.get(cfg.vpngate_api, timeout=cfg.http_timeout)
-        resp.raise_for_status()
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:  # noqa: BLE001 - 需要降级到镜像
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+def extra_sources() -> list[str]:
+    raw = os.environ.get("VPNGATE_EXTRA_SOURCES", "").strip()
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
-    try:
-        log("VPN GATE", f"回退镜像: {cfg.vpngate_mirror}")
-        resp = session.get(cfg.vpngate_mirror, timeout=cfg.http_timeout)
-        resp.raise_for_status()
-        rows = parse_mirror_json(resp.json())
-        if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
-            return rows, "github-mirror"
-    except Exception as exc:  # noqa: BLE001
-        log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN GATE", "官方 API 与回退镜像均不可用，数据源完全失败")
+
+def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str, Any]], str]:
+    """多源并行思路的串行实现：全部拉一遍，按 (IP, HostName) 去重合并。
+
+    单个源失败不影响整体；只有全部源都拿不到数据才判失败。
+    返回 (合并后的原始行, 实际生效的源名单)。
+    """
+    sources = [cfg.vpngate_api, cfg.vpngate_mirror] + extra_sources()
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    used: list[str] = []
+    for url in sources:
+        try:
+            log("VPN GATE", f"拉取数据源: {url}")
+            resp = session.get(url, timeout=cfg.http_timeout)
+            resp.raise_for_status()
+            body = resp.text.lstrip()
+            if body[:1] in ("{", "["):
+                rows = parse_mirror_json(resp.json())
+            else:
+                rows = parse_csv(resp.text)
+        except Exception as exc:  # noqa: BLE001 - 单源失败继续下一个
+            log("VPN GATE", f"数据源失败 {url}: {exc}")
+            continue
+        if not rows:
+            log("VPN GATE", f"数据源返回 0 条，跳过: {url}")
+            continue
+        label = urlsplit(url).netloc or url
+        if label not in used:
+            used.append(label)
+        for row in rows:
+            key = ((row.get("ip") or "").strip(), (row.get("host") or "").strip().lower())
+            if not key[0] and not key[1]:
+                continue
+            merged.setdefault(key, row)
+        log("VPN GATE", f"该源 {len(rows)} 条，累计去重后 {len(merged)} 条")
+    if not merged:
+        die("VPN GATE", "全部数据源均不可用，数据源完全失败")
+    log("VPN GATE", f"合并结果：{len(merged)} 个原始节点，来源 {', '.join(used) or 'unknown'}")
+    return list(merged.values()), " + ".join(used) if used else "multi-source"
 
 
 def parse_csv(text: str) -> list[dict[str, Any]]:
@@ -389,7 +406,6 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
             break
     if header_idx is None:
         raise RuntimeError("找不到 CSV 表头行 (HostName)")
-
     header = [h.strip().lstrip("*").lower() for h in lines[header_idx].lstrip("#").split(",")]
     column = {name: idx for idx, name in enumerate(header) if name}
 
@@ -459,7 +475,6 @@ def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
             servers.extend(item["servers"])
         elif isinstance(item, dict) and item.get("hostname"):
             servers.append(item)
-
     rows: list[dict[str, Any]] = []
     for server in servers:
         if not isinstance(server, dict):
@@ -538,14 +553,12 @@ def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
         port = int(match.group(2))
         if not 1 <= port <= 65535:
             continue
-
         host = (row.get("host") or "").strip().lower()
         if not host:
             continue
         # VPN Gate 主机名有时是 public-vpn-153，有时已是完整域名
         if "." not in host:
             host = f"{host}.opengw.net"
-
         nodes.append(
             Node(
                 host=host,
@@ -557,6 +570,41 @@ def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
                 score=row.get("score"),
             )
         )
+    return nodes
+
+
+def load_manual_nodes(path: str) -> list[Node]:
+    """读取手动节点池，弥补数据源缺失的国家（例如美国）。
+
+    文件格式：每行 `host:port [国家代码]`，# 之后是注释，空行忽略。
+        vpn1.example.com:443 US
+        1.2.3.4:8388 US   # 这是注释
+    """
+    nodes: list[Node] = []
+    if not path or not os.path.exists(path):
+        return nodes
+    with open(path, "r", encoding="utf-8-sig") as handle:
+        for raw in handle:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            endpoint = normalize_endpoint(parts[0])
+            if not endpoint:
+                log("MANUAL", f"跳过无法解析的行: {line}")
+                continue
+            host, _, port = endpoint.rpartition(":")
+            host = host.strip("[]")
+            code = parts[1].upper() if len(parts) > 1 else "??"
+            nodes.append(
+                Node(
+                    host=host,
+                    port=int(port),
+                    ip=host,
+                    country=COUNTRY_ZH.get(code, code),
+                    country_code=code,
+                )
+            )
     return nodes
 
 
@@ -578,6 +626,24 @@ def prioritize(nodes: list[Node]) -> list[Node]:
         nodes,
         key=lambda n: (n.ping is None, n.ping or 0, -(n.score or 0), n.host),
     )
+
+
+def interleave_by_country(nodes: list[Node]) -> list[Node]:
+    """按国家轮转排列：即使中途截断或整体超时，也不会整国消失。
+
+    国家内部仍按 prioritize 的顺序（ping 低的先测）。
+    """
+    buckets: dict[str, list[Node]] = {}
+    for node in prioritize(nodes):
+        buckets.setdefault(node.country_code or "??", []).append(node)
+    order = sorted(buckets, key=lambda k: (-len(buckets[k]), k))
+    depth = max((len(v) for v in buckets.values()), default=0)
+    out: list[Node] = []
+    for i in range(depth):
+        for key in order:
+            if i < len(buckets[key]):
+                out.append(buckets[key][i])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +695,6 @@ def check_one(
             result["error"] = f"HTTP {response.status_code}"
             result["worker_error"] = True
             return result
-
         payload = response.json()
         success = bool(payload.get("success"))
         result["success"] = success
@@ -639,7 +704,6 @@ def check_one(
         result["error"] = None if success else (
             payload.get("error") or payload.get("message") or "check failed"
         )
-
         exit_info = payload.get("exit") or {}
         if success and exit_info:
             asn = exit_info.get("asn") or {}
@@ -684,7 +748,6 @@ def check_all(
                 results.append(future.result())
         except TimeoutError:
             log("CLOUDFLARE WORKER", f"整体检测超时（{cfg.deadline_s:.0f}s），未完成的节点按失败处理")
-
     timed_out = 0
     for future in pending:
         node = futures[future]
@@ -771,6 +834,15 @@ def sanitize_remark(text: str) -> str:
     return re.sub(r"[#$\r\n]", "", text).strip() or "节点"
 
 
+def node_sort_key(node: dict[str, Any]) -> tuple[Any, ...]:
+    """按实测延迟优先排序；延迟缺失排后；住宅略优先于机房。"""
+    return (
+        node.get("latency_ms") is None,
+        node.get("latency_ms") or 0,
+        node.get("residential") != "residential",
+    )
+
+
 def build_outputs(
     results: list[dict[str, Any]],
     raw_count: int,
@@ -791,16 +863,12 @@ def build_outputs(
         if group["name"] == code and name:
             group["name"] = name
         group["nodes"].append(node)
-
     for group in countries.values():
         group["count"] = len(group["nodes"])
         group["residential"] = sum(1 for n in group["nodes"] if n.get("residential") == "residential")
         group["datacenter"] = sum(1 for n in group["nodes"] if n.get("residential") == "datacenter")
         group["unknown"] = group["count"] - group["residential"] - group["datacenter"]
-        group["nodes"].sort(
-            key=lambda n: (n.get("residential") != "residential", n.get("latency_ms") is None, n.get("latency_ms") or 0)
-        )
-
+        group["nodes"].sort(key=node_sort_key)
     stats = {
         "raw_nodes": raw_count,
         "sstp_nodes": sstp_count,
@@ -837,10 +905,7 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
     )
     for code, group in ordered:
         name = COUNTRY_ZH.get(code) or group.get("name") or code
-        nodes = sorted(
-            group["nodes"],
-            key=lambda n: (n.get("residential") != "residential", n.get("latency_ms") is None, n.get("latency_ms") or 0),
-        )
+        nodes = sorted(group["nodes"], key=node_sort_key)
         residential = [n for n in nodes if n.get("residential") == "residential"]
         others = [n for n in nodes if n.get("residential") != "residential"]
         chosen = residential[: cfg.max_residential_per_country] + others[: cfg.max_datacenter_per_country]
@@ -890,6 +955,7 @@ def write_outputs(
             ".catch(e=>out.textContent='加载失败: '+e)</script></html>"
         )
     atomic_write_text(html_path, html)
+
     nodes_text = build_nodes_text(data, edge_hosts, cfg)
     atomic_write_text(nodes_path, nodes_text)
     return data_path, html_path, nodes_path, nodes_text
@@ -923,6 +989,20 @@ def write_step_summary(data: dict[str, Any], nodes_count: int, cfg: Config) -> N
         handle.write("".join(rows))
 
 
+def warn_if_degraded(data: dict[str, Any], cfg: Config) -> None:
+    """数据源退化（国家数/可用数过少）时明确告警，避免静默发布烂数据。"""
+    countries = int(data["stats"]["countries"])
+    success = int(data["stats"]["success"])
+    if countries >= cfg.min_countries and success >= 20:
+        return
+    message = f"覆盖国家仅 {countries} 个、可用节点 {success} 个，数据源可能不完整或被截断"
+    log("RESULT", f"[警告] {message}")
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(f"\n> ⚠️ {message}\n")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -933,7 +1013,7 @@ def main() -> None:
     except ConfigError as exc:
         die("配置", str(exc))
 
-    session = make_session(pool_size=cfg.concurrency)
+    session = make_session(pool_size=max(32, cfg.concurrency))
     log("CONFIG", f"检测地址: {cfg.worker_base.rsplit('?', 1)[0]}?sstp=***")
     log("CONFIG", f"并发 {cfg.concurrency}, 单节点超时 {cfg.check_timeout}s, 整体截止 {cfg.deadline_s}s")
 
@@ -944,14 +1024,23 @@ def main() -> None:
 
     sstp_nodes = to_sstp_nodes(rows)
     sstp_count = len(sstp_nodes)
-    if sstp_count == 0:
+
+    manual_nodes = load_manual_nodes(cfg.manual_nodes_file)
+    if manual_nodes:
+        log("MANUAL", f"手动节点池 {len(manual_nodes)} 个（来自 {os.path.basename(cfg.manual_nodes_file)}）")
+
+    if sstp_count == 0 and not manual_nodes:
         die("VPN GATE", f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点")
 
-    unique_nodes = prioritize(dedupe_nodes(sstp_nodes))
+    # 国家轮转：保证任何截断/超时都不会整国消失
+    unique_nodes = interleave_by_country(dedupe_nodes(list(sstp_nodes) + manual_nodes))
     if cfg.max_check_nodes > 0:
         unique_nodes = unique_nodes[: cfg.max_check_nodes]
 
-    log("VPN GATE", f"原始节点 {raw_count}, SSTP {sstp_count}, 去重后 {len(unique_nodes)}")
+    log(
+        "VPN GATE",
+        f"原始节点 {raw_count}, SSTP {sstp_count}, 手动补 {len(manual_nodes)}, 去重后 {len(unique_nodes)}",
+    )
     log("CLOUDFLARE WORKER", f"提交检测: {len(unique_nodes)}")
 
     check_started = time.time()
@@ -961,12 +1050,10 @@ def main() -> None:
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
     worker_errors = [r for r in failed if r.get("worker_error")]
-
     log("CLOUDFLARE WORKER", f"成功 {len(success)}, 失败 {len(failed)}（Worker 异常 {len(worker_errors)}）, 用时 {elapsed:.1f}s")
 
     if unique_nodes and not success and len(worker_errors) == len(unique_nodes):
         die("CLOUDFLARE WORKER", "检测 Worker 全部请求异常，本次不发布（保留上一次产物）")
-
     if unique_nodes and not success:
         die("RESULT", "所有节点检测失败，本次不发布（保留上一次产物）")
 
@@ -988,11 +1075,16 @@ def main() -> None:
         duration_s=time.time() - started,
         timed_out=timed_out,
     )
+    warn_if_degraded(data, cfg)
 
     edge_hosts = get_combined_edge_hosts(cfg, session)
     data_path, html_path, nodes_path, nodes_text = write_outputs(data, cfg, edge_hosts)
     nodes_count = len([line for line in nodes_text.splitlines() if line.strip()])
     log("RESULT", f"可用节点 {data['stats']['success']}, 国家/地区 {data['stats']['countries']}, nodes.txt {nodes_count} 行")
+
+    us_count = data["countries"].get("US", {}).get("count", 0)
+    log("RESULT", f"美国节点：可用 {us_count} 个")
+
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
