@@ -66,8 +66,9 @@ jobs:
           MAX_DATACENTER_PER_COUNTRY: '30'
           # 覆盖国家少于该值时在日志与 Summary 里告警（只告警不中断）
           MIN_COUNTRIES: '10'
-          # 额外数据源：逗号分隔的 CSV/JSON 地址，会与官方 API、镜像一起合并去重
-          # VPNGATE_EXTRA_SOURCES: 'https://example.com/vpngate.json'
+          # 额外数据源：逗号分隔的 CSV/JSON 地址，会与官方 API 合并去重
+          # 这里默认启用 GitHub 镜像，把 VPN Gate 全量列表（~100 条 JSON）合并进来
+          VPNGATE_EXTRA_SOURCES: 'https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json'
         run: python vpngate.py
       - name: Ensure GitHub Pages is enabled
         env:
