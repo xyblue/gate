@@ -45,10 +45,10 @@ SCHEMA_VERSION = 1
 
 # VPN Gate 没有 HTTPS 接口，官方 API 只提供 HTTP。
 # 注意：api/iphone 是移动端快照，通常只有约 100 条，且排序偏向亚洲节点。
+# 镜像源默认不启用（会让测试拉到真实外网数据），需要时在 workflow 里设
+# VPNGATE_EXTRA_SOURCES 或 VPNGATE_MIRROR 环境变量。
 DEFAULT_VPNGATE_API = "http://www.vpngate.net/api/iphone/"
-DEFAULT_VPNGATE_MIRROR = (
-    "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json"
-)
+DEFAULT_VPNGATE_MIRROR = ""
 DEFAULT_OPTIMAL_API = "https://cf.090227.xyz/ct?ips=6&port=443"
 
 # 占位符检测：命中任意一个就认为用户还没配置
@@ -279,10 +279,10 @@ class Config:
     optimal_api: str
     nodes_url: str
     min_success_ratio: float
-    max_residential_per_country: int
-    max_datacenter_per_country: int
-    manual_nodes_file: str
-    min_countries: int
+    max_residential_per_country: int = 20
+    max_datacenter_per_country: int = 10
+    manual_nodes_file: str = ""
+    min_countries: int = 10
 
     @classmethod
     def load(cls) -> "Config":
@@ -363,7 +363,7 @@ def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str
     单个源失败不影响整体；只有全部源都拿不到数据才判失败。
     返回 (合并后的原始行, 实际生效的源名单)。
     """
-    sources = [cfg.vpngate_api, cfg.vpngate_mirror] + extra_sources()
+    sources = [u for u in [cfg.vpngate_api, cfg.vpngate_mirror] + extra_sources() if u.strip()]
     merged: dict[tuple[str, str], dict[str, Any]] = {}
     used: list[str] = []
     for url in sources:
@@ -835,11 +835,11 @@ def sanitize_remark(text: str) -> str:
 
 
 def node_sort_key(node: dict[str, Any]) -> tuple[Any, ...]:
-    """按实测延迟优先排序；延迟缺失排后；住宅略优先于机房。"""
+    """住宅优先 → 延迟低者优先 → 延迟缺失排后。"""
     return (
+        node.get("residential") != "residential",
         node.get("latency_ms") is None,
         node.get("latency_ms") or 0,
-        node.get("residential") != "residential",
     )
 
 
