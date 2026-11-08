@@ -12,13 +12,13 @@ on:
         required: false
         default: '0'
       concurrency:
-        description: '并发数（建议 16–32）'
+        description: '并发数（建议 32–64）'
         required: false
-        default: '32'
+        default: '64'
       timeout:
         description: '单节点检测超时（秒）'
         required: false
-        default: '25'
+        default: '30'
 permissions:
   contents: read
   pages: write
@@ -55,10 +55,19 @@ jobs:
       - name: Run pipeline
         env:
           CHECK_WORKER: "https://${{ secrets.DOMAIN }}/check?sstp=vpn:vpn@"
-          CHECK_CONCURRENCY: ${{ github.event.inputs.concurrency || '32' }}
-          CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '25' }}
+          CHECK_CONCURRENCY: ${{ github.event.inputs.concurrency || '64' }}
+          CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '30' }}
+          CHECK_DEADLINE: '2400'
           MAX_CHECK_NODES: ${{ github.event.inputs.max_nodes || '0' }}
-          MIN_SUCCESS_RATIO: '0'
+          # 源变大后不再因成功率偏低而整批作废（低于该值则拒绝发布，保留上一次产物）
+          MIN_SUCCESS_RATIO: '0.15'
+          # 每国发布上限：住宅 / 其它（机房+未知）。调大避免像韩国那样 23 个被砍成 20 个
+          MAX_RESIDENTIAL_PER_COUNTRY: '40'
+          MAX_DATACENTER_PER_COUNTRY: '30'
+          # 覆盖国家少于该值时在日志与 Summary 里告警（只告警不中断）
+          MIN_COUNTRIES: '10'
+          # 额外数据源：逗号分隔的 CSV/JSON 地址，会与官方 API、镜像一起合并去重
+          # VPNGATE_EXTRA_SOURCES: 'https://example.com/vpngate.json'
         run: python vpngate.py
       - name: Ensure GitHub Pages is enabled
         env:
@@ -74,6 +83,7 @@ jobs:
             exit 0
           fi
           if [ "${status}" = "404" ]; then
+            # 创建站点必须用 POST，且 workflow 构建类型不接受 source 字段
             create=$(curl -sS -o /tmp/pages-create.json -w '%{http_code}' -X POST \
               "${auth[@]}" -H "Content-Type: application/json" \
               -d '{"build_type":"workflow"}' "${api}")
